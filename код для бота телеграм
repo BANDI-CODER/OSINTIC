@@ -1,0 +1,619 @@
+import logging
+import sqlite3
+import re
+import time
+import os
+import shutil
+from datetime import datetime, timedelta
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import (
+    Updater,
+    CommandHandler,
+    MessageHandler,
+    Filters,
+    CallbackContext,
+    ConversationHandler
+)
+
+# Конфигурация
+BOT_TOKEN = "7718428534:AAF9EVtiIU53lQQ87If4kS92qWFpc88Hyjw"
+ADMIN_CHAT_ID = 5157370467
+DB_NAME = "user_data.db"
+BACKUP_DIR = "backups"
+
+# Создаем директорию для бэкапов
+os.makedirs(BACKUP_DIR, exist_ok=True)
+
+# Состояния для ConversationHandler
+MAIN_MENU, ADMIN_MENU, WAITING_FOR_ID, WAITING_FOR_MESSAGE = range(4)
+
+# Настройка логгирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    filename='bot.log',
+    filemode='a'
+)
+logger = logging.getLogger(__name__)
+
+# Инициализация базы данных
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    
+    # Таблица пользователей
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER UNIQUE,
+                first_name TEXT,
+                last_name TEXT,
+                username TEXT,
+                language_code TEXT,
+                profile_link TEXT,
+                registration_date TEXT,
+                last_activity TEXT,
+                message_count INTEGER DEFAULT 0,
+                is_banned BOOLEAN DEFAULT 0
+                )''')
+    
+    # ИСПРАВЛЕННАЯ таблица сообщений
+    c.execute('''CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                message_text TEXT,
+                timestamp TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(user_id)
+                ''')
+    
+    # Таблица админов
+    c.execute('''CREATE TABLE IF NOT EXISTS admins (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER UNIQUE,
+                username TEXT,
+                added_date TEXT
+                )''')
+    
+    # ИСПРАВЛЕННАЯ таблица банов
+    c.execute('''CREATE TABLE IF NOT EXISTS bans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                admin_id INTEGER,
+                reason TEXT,
+                timestamp TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(user_id),
+                FOREIGN KEY(admin_id) REFERENCES admins(admin_id)
+                ''')
+    
+    # Добавляем администратора
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("INSERT OR IGNORE INTO admins (admin_id, username, added_date) VALUES (?, ?, ?)",
+              (ADMIN_CHAT_ID, "admin", now))
+    
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ======================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ======================
+
+def get_db_connection():
+    return sqlite3.connect(DB_NAME)
+
+def log_user_activity(user_id, message_text=None):
+    conn = get_db_connection()
+    c = conn.cursor()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    user = c.fetchone()
+    
+    if user:
+        c.execute("UPDATE users SET last_activity = ?, message_count = message_count + 1 WHERE user_id = ?", 
+                 (now, user_id))
+    else:
+        c.execute("INSERT INTO users (user_id, last_activity) VALUES (?, ?)", 
+                 (user_id, now))
+    
+    if message_text:
+        c.execute("INSERT INTO messages (user_id, message_text, timestamp) VALUES (?, ?, ?)",
+                 (user_id, message_text, now))
+    
+    conn.commit()
+    conn.close()
+
+def get_user_info(user_id):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    columns = [col[0] for col in c.description] if c.description else []
+    user = c.fetchone()
+    conn.close()
+    
+    if user and columns:
+        return dict(zip(columns, user))
+    return None
+
+def is_admin(user_id):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT * FROM admins WHERE admin_id = ?", (user_id,))
+    admin = c.fetchone()
+    conn.close()
+    return admin is not None
+
+def save_full_user_info(user):
+    conn = get_db_connection()
+    c = conn.cursor()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    profile_link = f"tg://user?id={user.id}"
+    
+    c.execute('''INSERT OR IGNORE INTO users 
+              (user_id, first_name, last_name, username, language_code, profile_link, registration_date, last_activity) 
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+              (user.id, user.first_name or "", user.last_name or "", user.username or "", 
+               user.language_code or "", profile_link, now, now))
+    
+    c.execute('''UPDATE users SET 
+              first_name = ?, 
+              last_name = ?, 
+              username = ?, 
+              language_code = ?, 
+              profile_link = ?,
+              last_activity = ?
+              WHERE user_id = ?''',
+              (user.first_name or "", user.last_name or "", user.username or "", 
+               user.language_code or "", profile_link, now, user.id))
+    
+    conn.commit()
+    conn.close()
+
+def get_user_stats():
+    stats = {
+        "total_users": 0,
+        "active_users": 0,
+        "banned_users": 0,
+        "total_messages": 0
+    }
+    
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        
+        c.execute("SELECT COUNT(*) FROM users")
+        stats["total_users"] = c.fetchone()[0] or 0
+        
+        week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+        c.execute("SELECT COUNT(*) FROM users WHERE last_activity > ?", (week_ago,))
+        stats["active_users"] = c.fetchone()[0] or 0
+        
+        c.execute("SELECT COUNT(*) FROM users WHERE is_banned = 1")
+        stats["banned_users"] = c.fetchone()[0] or 0
+        
+        c.execute("SELECT COUNT(*) FROM messages")
+        stats["total_messages"] = c.fetchone()[0] or 0
+        
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка получения статистики: {e}")
+    finally:
+        conn.close()
+    
+    return stats
+
+def create_backup():
+    """Создает резервную копию базы данных"""
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = os.path.join(BACKUP_DIR, f"backup_{timestamp}.db")
+        shutil.copyfile(DB_NAME, backup_path)
+        return backup_path
+    except Exception as e:
+        logger.error(f"Ошибка создания бэкапа: {e}")
+        return None
+
+# ======================
+# ОСНОВНЫЕ ФУНКЦИИ БОТА
+# ======================
+
+def start(update: Update, context: CallbackContext) -> int:
+    user = update.effective_user
+    log_user_activity(user.id)
+    save_full_user_info(user)
+    
+    if is_admin(user.id):
+        keyboard = [
+            ['🔍 Пробить пользователя', '👤 Мой профиль'],
+            ['👮 Админ-панель', 'ℹ️ О боте']
+        ]
+    else:
+        keyboard = [
+            ['🔍 Пробить себя', '👤 Мой профиль'],
+            ['ℹ️ О боте']
+        ]
+    
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    update.message.reply_text(
+        f"👋 Привет, {user.first_name}!\n"
+        "Я - мощный бот для анализа и сбора информации. Выберите действие:",
+        reply_markup=reply_markup
+    )
+    return MAIN_MENU
+
+def about_bot(update: Update, context: CallbackContext) -> int:
+    user = update.effective_user
+    log_user_activity(user.id)
+    
+    update.message.reply_text(
+        "🤖 <b>Информационный Анализатор PRO</b>\n\n"
+        "Версия: 3.1\n"
+        "Разработчик: Security Systems\n"
+        "Возможности:\n"
+        "- Сбор и анализ пользовательских данных\n"
+        "- Полная статистика активности\n"
+        "- Администрирование пользователей\n"
+        "- Система банов и предупреждений\n\n"
+        "Используйте бота ответственно!",
+        parse_mode='HTML'
+    )
+    return MAIN_MENU
+
+def my_profile(update: Update, context: CallbackContext) -> int:
+    user = update.effective_user
+    log_user_activity(user.id)
+    user_info = get_user_info(user.id)
+    
+    if user_info:
+        status = "🟢 Активен" if not user_info.get('is_banned', 0) else "🔴 Забанен"
+        
+        response = (
+            f"👤 <b>Ваш профиль:</b>\n\n"
+            f"🆔 ID: <code>{user_info.get('user_id', 'N/A')}</code>\n"
+            f"👤 Имя: {user_info.get('first_name', '❌')}\n"
+            f"👥 Фамилия: {user_info.get('last_name', '❌')}\n"
+            f"🌐 Username: @{user_info.get('username', '❌')}\n"
+            f"🌍 Язык: {user_info.get('language_code', '❌')}\n"
+            f"📅 Регистрация: {user_info.get('registration_date', '❌')}\n"
+            f"🕒 Последняя активность: {user_info.get('last_activity', '❌')}\n"
+            f"✉️ Сообщений: {user_info.get('message_count', 0)}\n"
+            f"🔒 Статус: {status}\n"
+            f"🔗 Профиль: {user_info.get('profile_link', '❌')}"
+        )
+    else:
+        response = "❌ Информация о вас не найдена в базе данных."
+    
+    update.message.reply_text(response, parse_mode='HTML')
+    return MAIN_MENU
+
+def probe_user(update: Update, context: CallbackContext) -> int:
+    user = update.effective_user
+    log_user_activity(user.id)
+    
+    if is_admin(user.id):
+        update.message.reply_text("Введите ID пользователя для проверки:")
+        return WAITING_FOR_ID
+    else:
+        return show_user_profile(update, context, user.id)
+
+def show_user_profile(update: Update, context: CallbackContext, target_user_id: int) -> int:
+    user_info = get_user_info(target_user_id)
+    
+    if user_info:
+        status = "🟢 Активен" if not user_info.get('is_banned', 0) else "🔴 Забанен"
+        admin_actions = ""
+        
+        if is_admin(update.effective_user.id):
+            if user_info.get('is_banned', 0):
+                admin_actions = f"\n\n🔓 <b>Админ-действия:</b>\n/unban_{user_info['user_id']} - Разбанить"
+            else:
+                admin_actions = f"\n\n🔒 <b>Админ-действия:</b>\n/ban_{user_info['user_id']} - Забанить"
+        
+        response = (
+            f"🔍 <b>Информация о пользователе:</b>\n\n"
+            f"🆔 ID: <code>{user_info.get('user_id', 'N/A')}</code>\n"
+            f"👤 Имя: {user_info.get('first_name', '❌')}\n"
+            f"👥 Фамилия: {user_info.get('last_name', '❌')}\n"
+            f"🌐 Username: @{user_info.get('username', '❌')}\n"
+            f"🌍 Язык: {user_info.get('language_code', '❌')}\n"
+            f"📅 Регистрация: {user_info.get('registration_date', '❌')}\n"
+            f"🕒 Последняя активность: {user_info.get('last_activity', '❌')}\n"
+            f"✉️ Сообщений: {user_info.get('message_count', 0)}\n"
+            f"🔒 Статус: {status}\n"
+            f"🔗 Профиль: {user_info.get('profile_link', '❌')}"
+            f"{admin_actions}"
+        )
+    else:
+        response = "❌ Пользователь не найден в базе данных."
+    
+    update.message.reply_text(response, parse_mode='HTML')
+    return MAIN_MENU if not is_admin(update.effective_user.id) else ADMIN_MENU
+
+def handle_user_id(update: Update, context: CallbackContext) -> int:
+    user_input = update.message.text
+    log_user_activity(update.effective_user.id)
+    
+    if user_input.isdigit():
+        return show_user_profile(update, context, int(user_input))
+    else:
+        update.message.reply_text("❌ Неверный формат ID. Введите числовой идентификатор пользователя.")
+        return WAITING_FOR_ID
+
+def admin_panel(update: Update, context: CallbackContext) -> int:
+    user = update.effective_user
+    log_user_activity(user.id)
+    
+    if not is_admin(user.id):
+        update.message.reply_text("⛔ У вас нет прав доступа к админ-панели!")
+        return MAIN_MENU
+    
+    keyboard = [
+        ['📊 Статистика', '📢 Рассылка'],
+        ['🔄 Бэкап базы'],
+        ['🔙 Главное меню']
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    update.message.reply_text("👮 <b>Административная панель</b>\nВыберите действие:", 
+                             reply_markup=reply_markup, parse_mode='HTML')
+    return ADMIN_MENU
+
+def show_stats(update: Update, context: CallbackContext) -> int:
+    user = update.effective_user
+    log_user_activity(user.id)
+    
+    if not is_admin(user.id):
+        update.message.reply_text("⛔ У вас нет прав доступа!")
+        return MAIN_MENU
+    
+    stats = get_user_stats()
+    
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("SELECT user_id, first_name, message_count FROM users ORDER BY message_count DESC LIMIT 5")
+        top_users = c.fetchall()
+        top_users_text = "\n".join(
+            [f"{idx+1}. {user[1] or 'Unknown'}: {user[2]} сообщ." for idx, user in enumerate(top_users)]
+        )
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка получения топ пользователей: {e}")
+        top_users_text = "Не удалось получить данные"
+    finally:
+        conn.close()
+    
+    response = (
+        f"📊 <b>Статистика бота:</b>\n\n"
+        f"👥 Всего пользователей: {stats['total_users']}\n"
+        f"🟢 Активных (7 дней): {stats['active_users']}\n"
+        f"🔴 Забаненных: {stats['banned_users']}\n"
+        f"✉️ Всего сообщений: {stats['total_messages']}\n\n"
+        f"🏆 <b>Топ-5 активных пользователей:</b>\n{top_users_text}"
+    )
+    
+    update.message.reply_text(response, parse_mode='HTML')
+    return ADMIN_MENU
+
+def broadcast_message(update: Update, context: CallbackContext) -> int:
+    user = update.effective_user
+    log_user_activity(user.id)
+    
+    if not is_admin(user.id):
+        update.message.reply_text("⛔ У вас нет прав доступа!")
+        return MAIN_MENU
+    
+    update.message.reply_text("✉️ Введите сообщение для рассылки всем пользователям:")
+    return WAITING_FOR_MESSAGE
+
+def send_broadcast(update: Update, context: CallbackContext) -> int:
+    message_text = update.message.text
+    admin_id = update.effective_user.id
+    
+    conn = get_db_connection()
+    c = conn.cursor()
+    try:
+        c.execute("SELECT user_id FROM users WHERE is_banned = 0")
+        users = c.fetchall()
+    except sqlite3.Error as e:
+        logger.error(f"Ошибка получения пользователей: {e}")
+        users = []
+    finally:
+        conn.close()
+    
+    total_users = len(users)
+    success_count = 0
+    fail_count = 0
+    
+    for user in users:
+        try:
+            context.bot.send_message(chat_id=user[0], text=message_text)
+            success_count += 1
+        except Exception as e:
+            logger.error(f"Ошибка рассылки для {user[0]}: {e}")
+            fail_count += 1
+        time.sleep(0.1)
+    
+    report = (
+        f"📢 <b>Результат рассылки:</b>\n\n"
+        f"✉️ Сообщение: {message_text}\n"
+        f"👥 Всего пользователей: {total_users}\n"
+        f"✅ Успешно: {success_count}\n"
+        f"❌ Не доставлено: {fail_count}"
+    )
+    
+    context.bot.send_message(chat_id=admin_id, text=report, parse_mode='HTML')
+    return admin_panel(update, context)
+
+def ban_user(update: Update, context: CallbackContext) -> None:
+    user = update.effective_user
+    command = update.message.text
+    
+    if not is_admin(user.id):
+        update.message.reply_text("⛔ У вас нет прав доступа!")
+        return
+    
+    match = re.search(r'/ban_(\d+)', command)
+    if match:
+        target_user_id = int(match.group(1))
+        
+        conn = get_db_connection()
+        c = conn.cursor()
+        try:
+            c.execute("SELECT is_banned FROM users WHERE user_id = ?", (target_user_id,))
+            result = c.fetchone()
+            
+            if result and result[0] == 1:
+                update.message.reply_text(f"⚠️ Пользователь {target_user_id} уже забанен.")
+                return
+            
+            c.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (target_user_id,))
+            
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            c.execute("INSERT INTO bans (user_id, admin_id, reason, timestamp) VALUES (?, ?, ?, ?)",
+                     (target_user_id, user.id, "Команда администратора", now))
+            
+            conn.commit()
+            update.message.reply_text(f"✅ Пользователь {target_user_id} успешно забанен.")
+            
+            try:
+                context.bot.send_message(
+                    chat_id=target_user_id,
+                    text="⛔ Вы были заблокированы в этом боте администратором."
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось уведомить пользователя {target_user_id} о бане: {e}")
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка бана пользователя: {e}")
+            update.message.reply_text("❌ Ошибка при выполнении операции")
+        finally:
+            conn.close()
+    else:
+        update.message.reply_text("❌ Неверный формат команды. Используйте /ban_123456789")
+
+def unban_user(update: Update, context: CallbackContext) -> None:
+    user = update.effective_user
+    command = update.message.text
+    
+    if not is_admin(user.id):
+        update.message.reply_text("⛔ У вас нет прав доступа!")
+        return
+    
+    match = re.search(r'/unban_(\d+)', command)
+    if match:
+        target_user_id = int(match.group(1))
+        
+        conn = get_db_connection()
+        c = conn.cursor()
+        try:
+            c.execute("SELECT is_banned FROM users WHERE user_id = ?", (target_user_id,))
+            result = c.fetchone()
+            
+            if result and result[0] == 0:
+                update.message.reply_text(f"⚠️ Пользователь {target_user_id} не забанен.")
+                return
+            
+            c.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (target_user_id,))
+            conn.commit()
+            update.message.reply_text(f"✅ Пользователь {target_user_id} успешно разбанен.")
+            
+            try:
+                context.bot.send_message(
+                    chat_id=target_user_id,
+                    text="✅ Ваша блокировка в этом боте была снята администратором."
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось уведомить пользователя {target_user_id} о разбане: {e}")
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка разбана пользователя: {e}")
+            update.message.reply_text("❌ Ошибка при выполнении операции")
+        finally:
+            conn.close()
+    else:
+        update.message.reply_text("❌ Неверный формат команды. Используйте /unban_123456789")
+
+def backup_database(update: Update, context: CallbackContext) -> int:
+    user = update.effective_user
+    log_user_activity(user.id)
+    
+    if not is_admin(user.id):
+        update.message.reply_text("⛔ У вас нет прав доступа!")
+        return ADMIN_MENU
+    
+    try:
+        backup_path = create_backup()
+        if backup_path:
+            context.bot.send_document(
+                chat_id=user.id,
+                document=open(backup_path, 'rb'),
+                filename=os.path.basename(backup_path)
+            )
+            update.message.reply_text("✅ Резервная копия базы данных успешно создана.")
+        else:
+            update.message.reply_text("❌ Ошибка создания резервной копии!")
+    except Exception as e:
+        logger.error(f"Ошибка создания бэкапа: {e}")
+        update.message.reply_text("❌ Ошибка создания резервной копии!")
+    return ADMIN_MENU
+
+def handle_message(update: Update, context: CallbackContext) -> int:
+    user = update.effective_user
+    text = update.message.text
+    log_user_activity(user.id, text)
+    save_full_user_info(user)
+    
+    update.message.reply_text(
+        "🤖 Я не понял вашего сообщения. Пожалуйста, используйте кнопки меню "
+        "или команду /start для возврата в главное меню."
+    )
+    return MAIN_MENU
+
+# ======================
+# ЗАПУСК БОТА
+# ======================
+
+def main():
+    # Создаем начальный бэкап
+    create_backup()
+    
+    updater = Updater(BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    # Обработчики команд
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states={
+            MAIN_MENU: [
+                MessageHandler(Filters.regex('^🔍 Пробить пользователя$'), probe_user),
+                MessageHandler(Filters.regex('^🔍 Пробить себя$'), probe_user),
+                MessageHandler(Filters.regex('^👤 Мой профиль$'), my_profile),
+                MessageHandler(Filters.regex('^ℹ️ О боте$'), about_bot),
+                MessageHandler(Filters.regex('^👮 Админ-панель$'), admin_panel)
+            ],
+            ADMIN_MENU: [
+                MessageHandler(Filters.regex('^📊 Статистика$'), show_stats),
+                MessageHandler(Filters.regex('^📢 Рассылка$'), broadcast_message),
+                MessageHandler(Filters.regex('^🔄 Бэкап базы$'), backup_database),
+                MessageHandler(Filters.regex('^🔙 Главное меню$'), start)
+            ],
+            WAITING_FOR_ID: [
+                MessageHandler(Filters.text & ~Filters.command, handle_user_id)
+            ],
+            WAITING_FOR_MESSAGE: [
+                MessageHandler(Filters.text & ~Filters.command, send_broadcast)
+            ]
+        },
+        fallbacks=[CommandHandler('start', start)],
+    )
+
+    # Регистрируем обработчики
+    dp.add_handler(conv_handler)
+    dp.add_handler(MessageHandler(Filters.regex(r'^/ban_\d+$'), ban_user))
+    dp.add_handler(MessageHandler(Filters.regex(r'^/unban_\d+$'), unban_user))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
+
+    # Запускаем бота
+    updater.start_polling()
+    logger.info("Бот запущен и работает...")
+    updater.idle()
+
+if __name__ == '__main__':
+    main()
